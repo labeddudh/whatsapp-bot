@@ -14,7 +14,7 @@ const router = createRouter({
     routes: [
         { path: '/', redirect: '/dashboard' },
         { path: '/login', component: Login },
-        { path: '/register', component: Register },
+        // { path: '/register', component: Register },
         { path: '/dashboard', component: Dashboard, meta: { auth: true } },
         { path: '/bot/:credkey', component: BotDetail, meta: { auth: true } },
         { path: '/chat/:credkey', component: ChatView, meta: { auth: true } },
