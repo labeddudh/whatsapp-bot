@@ -5,3 +5,4 @@
 # Mengabaikan file dokumentasi internal
 DESIGN.md
 PRODUCT.md
+node_modules
