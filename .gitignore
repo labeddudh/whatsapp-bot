@@ -1,6 +1,7 @@
 # Mengabaikan folder atau file sistem tertentu
 .impeccable
 .opencode
+.env
 
 # Mengabaikan file dokumentasi internal
 DESIGN.md
