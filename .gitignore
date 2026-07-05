@@ -1,0 +1,7 @@
+# Mengabaikan folder atau file sistem tertentu
+.impeccable
+.opencode
+
+# Mengabaikan file dokumentasi internal
+DESIGN.md
+PRODUCT.md

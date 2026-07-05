@@ -1,0 +1,24 @@
+{
+  "name": "wav2",
+  "version": "1.0.0",
+  "main": "app2.js",
+  "scripts": {
+    "dev": "node app2.js",
+    "start": "node app2.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "baileys": "^6.7.20",
+    "bcryptjs": "3.0.3",
+    "dotenv": "17.4.2",
+    "express": "^5.1.0",
+    "jsonwebtoken": "9.0.3",
+    "mysql2": "3.22.5",
+    "qrcode": "^1.5.4",
+    "winston": "^3.17.0"
+  }
+}

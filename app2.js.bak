@@ -1,0 +1,490 @@
+const {
+    default: makeWASocket,
+    useMultiFileAuthState,
+    DisconnectReason,
+    fetchLatestWaWebVersion,
+    Browsers
+} = require('baileys');
+const { toDataURL } = require('qrcode');
+const fs = require('fs');
+const fsp = fs.promises;
+const path = require('path');
+const express = require('express');
+const http = require('http');
+const { createLogger, format, transports } = require('winston');
+require('dotenv').config();
+const db = require('./db');
+// ponytail: reuse requireAuth from auth.js, no new middleware
+const { requireAuth, register, login } = require('./auth');
+
+// helper: verify sender belongs to calling user
+async function requireOwnership(req, res) {
+    const sender = req.body?.sender || req.query?.sender;
+    if (!sender) { res.status(400).json({ status: false, message: 'sender wajib diisi' }); return false; }
+    const cred = await db.getCredByKey(sender);
+    if (!cred || cred.user_id !== req.user.id) { res.status(403).json({ status: false, message: 'Akses ditolak' }); return false; }
+    return true;
+}
+const botsRouter = require('./routes/bots');
+
+const app = express();
+const server = http.createServer(app);
+const port = process.env.APP_PORT || 3000;
+
+const authInfoDir = path.join(__dirname, 'auth_info');
+const logger = createLogger({
+    level: 'info',
+    format: format.combine(
+        format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
+        format.printf(info => `${info.timestamp} ${info.level}: ${info.message}`)
+    ),
+    transports: [
+        new transports.File({ filename: path.join(__dirname, 'combined.log') }),
+        new transports.Console()
+    ]
+});
+
+app.use(express.json());
+
+// -------------------- Auth & Bot Routes --------------------
+app.post('/auth/register', register);
+app.post('/auth/login', login);
+app.use('/bots', botsRouter);
+
+// API key middleware untuk send endpoints
+async function requireApiKey(req, res, next) {
+    const key = req.headers['x-api-key'] || req.body.api_key;
+    if (!key) return res.status(401).json({ status: false, message: 'x-api-key header required' });
+    const cred = await db.getCredByApiKey(key);
+    if (!cred) return res.status(401).json({ status: false, message: 'Invalid API key' });
+    req.credkey = cred.credkey;
+    // ponytail: inject sender from api key so caller doesnt need to send it
+    if (!req.body.sender) req.body.sender = cred.credkey;
+    next();
+}
+
+const sessionMap = new Map();
+const qrStore = new Map();
+const reconnectTimers = new Map();
+// ponytail: webhook url now persisted in DB, no in-memory store needed
+
+// -------------------- Helpers --------------------
+function clearReconnectTimer(credkey) {
+    const timer = reconnectTimers.get(credkey);
+    if (timer) clearTimeout(timer);
+    reconnectTimers.delete(credkey);
+}
+
+function scheduleReconnect(credkey) {
+    if (reconnectTimers.has(credkey)) return;
+    const timer = setTimeout(async () => {
+        reconnectTimers.delete(credkey);
+        try { await connectToWhatsApp(credkey); } catch (err) { logger.error(err); scheduleReconnect(credkey); }
+    }, 5000);
+    reconnectTimers.set(credkey, timer);
+}
+
+async function ensureAuthInfoFolder() {
+    await fsp.mkdir(authInfoDir, { recursive: true });
+}
+
+async function deleteSessionFolder(credkey) {
+    const folderPath = path.join(authInfoDir, credkey);
+    try { await fsp.rm(folderPath, { recursive: true, force: true }); } catch { }
+}
+
+async function removeSessionCompletely(credkey) {
+    clearReconnectTimer(credkey);
+    qrStore.delete(credkey);
+    sessionMap.delete(credkey);
+    await deleteSessionFolder(credkey);
+}
+
+function updateLastActive(credkey) {
+    const session = sessionMap.get(credkey);
+    if (!session) return;
+    session.lastActive = Date.now();
+}
+
+function phoneNumberFormatter(number) {
+    let formatted = String(number).trim();
+    if (formatted.endsWith('@s.whatsapp.net')) return formatted;
+    if (formatted.endsWith('@c.us')) return formatted.replace('@c.us', '@s.whatsapp.net');
+    formatted = formatted.replace(/\D/g, '');
+    if (formatted.startsWith('0')) formatted = '62' + formatted.slice(1);
+    return `${formatted}@s.whatsapp.net`;
+}
+
+const WEBHOOK_MAX_RETRIES = 3;
+const WEBHOOK_RETRY_DELAYS = [5000, 15000, 30000]; // ms: 5s, 15s, 30s
+
+async function fireWebhook(credkey, payload, attempt = 0) {
+    const url = await db.getWebhook(credkey);
+    if (!url) return;
+    try {
+        const res = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+            signal: AbortSignal.timeout(10000)
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    } catch (err) {
+        if (attempt < WEBHOOK_MAX_RETRIES) {
+            const delay = WEBHOOK_RETRY_DELAYS[attempt];
+            logger.warn(`Webhook gagal (${credkey}), retry ${attempt + 1}/${WEBHOOK_MAX_RETRIES} dalam ${delay / 1000}s: ${err.message}`);
+            setTimeout(() => fireWebhook(credkey, payload, attempt + 1), delay);
+        } else {
+            logger.error(`Webhook gagal permanen (${credkey}) setelah ${WEBHOOK_MAX_RETRIES} retry: ${err.message}`);
+        }
+    }
+}
+
+function bindSocketEvents(sock, credkey, saveCreds) {
+    sock.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect, qr } = update;
+        if (qr) {
+            const dataUrl = await toDataURL(qr);
+            qrStore.set(credkey, { dataUrl, updatedAt: new Date().toISOString() });
+        }
+        if (connection === 'open') {
+            clearReconnectTimer(credkey);
+            qrStore.delete(credkey);
+            updateLastActive(credkey);
+        }
+        if (connection === 'close') {
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
+            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+            if (shouldReconnect) { sessionMap.delete(credkey); scheduleReconnect(credkey); }
+            else removeSessionCompletely(credkey);
+        }
+    });
+    sock.ev.on('creds.update', saveCreds);
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+        if (type !== 'notify') return;
+        for (const msg of messages) {
+            if (msg.key.fromMe) continue;
+            updateLastActive(credkey);
+            const from = msg.key.remoteJid || '';
+            const isGroup = from.endsWith('@g.us');
+            const text =
+                msg.message?.conversation ||
+                msg.message?.extendedTextMessage?.text ||
+                msg.message?.imageMessage?.caption ||
+                msg.message?.videoMessage?.caption || '';
+            const messageType = msg.message ? Object.keys(msg.message)[0] : 'unknown';
+            db.logMessage(credkey, 'in', from, messageType, text, msg.key.id).catch(err => logger.error('DB logMessage: ' + err));
+            await fireWebhook(credkey, {
+                event: 'message',
+                sender: credkey,
+                from,
+                isGroup,
+                participant: isGroup ? (msg.key.participant || '') : from,
+                text,
+                messageType,
+                timestamp: msg.messageTimestamp,
+                messageId: msg.key.id
+            });
+        }
+    });
+}
+
+async function connectToWhatsApp(credkey) {
+    await ensureAuthInfoFolder();
+    const folderPath = path.join(authInfoDir, credkey);
+    await fsp.mkdir(folderPath, { recursive: true });
+
+    const { version } = await fetchLatestWaWebVersion();
+    const { state, saveCreds } = await useMultiFileAuthState(folderPath);
+
+    const sock = makeWASocket({
+        auth: state,
+        version,
+        printQRInTerminal: true,
+        browser: Browsers.windows('Chrome'),
+        syncFullHistory: false,
+        maxMsgRetryCount: 10
+    });
+
+    sessionMap.set(credkey, { sock, lastActive: Date.now() });
+    bindSocketEvents(sock, credkey, saveCreds);
+    return sock;
+}
+
+async function ensureSession(credkey) {
+    if (sessionMap.has(credkey)) return { started: false, restored: true, hasQr: qrStore.has(credkey) };
+    const folderPath = path.join(authInfoDir, credkey);
+    const restored = await fsp.access(folderPath).then(() => true).catch(() => false);
+    await connectToWhatsApp(credkey);
+    return { started: true, restored, hasQr: qrStore.has(credkey) };
+}
+
+// -------------------- API --------------------
+// Test
+app.get('/', (req, res) => res.send('WhatsApp Gateway berjalan'));
+
+// Status session
+app.get('/status', requireAuth, (req, res) => {
+    const sender = req.query.sender || req.body?.sender;
+    if (!sender) return res.status(400).json({ status: false, message: 'sender required' });
+    const session = sessionMap.get(sender);
+    if (!session?.sock) return res.json({ status: false, state: 'disconnected' });
+    const state = session.sock.ws?.readyState === 1 ? 'connected' : 'connecting';
+    const hasQr = qrStore.has(sender);
+    return res.json({ status: true, state: hasQr ? 'qr' : state, hasQr, lastActive: session.lastActive });
+});
+
+// Set Webhook
+app.post('/set-webhook', requireAuth, async (req, res) => {
+    const { sender, webhookUrl } = req.body;
+    if (!await requireOwnership(req, res)) return;
+    if (!webhookUrl) {
+        await db.setWebhook(sender, null);
+        return res.json({ status: true, message: 'Webhook dihapus' });
+    }
+    try { new URL(webhookUrl); } catch { return res.status(400).json({ status: false, message: 'webhookUrl tidak valid' }); }
+    await db.setWebhook(sender, webhookUrl);
+    logger.info(`Webhook set untuk ${sender}: ${webhookUrl}`);
+    res.json({ status: true, message: 'Webhook berhasil disimpan', sender, webhookUrl });
+});
+
+// Get Webhook
+app.get('/get-webhook', requireAuth, async (req, res) => {
+    if (!await requireOwnership(req, res)) return;
+    const sender = req.query.sender;
+    const url = await db.getWebhook(sender);
+    res.json({ status: true, sender, webhookUrl: url });
+});
+
+// Create / Restore Session
+app.post('/create-session', requireAuth, async (req, res) => {
+    try {
+        const { sender } = req.body;
+        if (!await requireOwnership(req, res)) return;
+        const result = await ensureSession(sender);
+        db.saveCred(sender).catch(err => logger.error('DB saveCred: ' + err));
+        const currentQr = qrStore.get(sender);
+        return res.json({ status: true, sender, qrUrl: currentQr ? `/get-qr?sender=${encodeURIComponent(sender)}` : null, ...result });
+    } catch (err) { res.status(500).json({ status: false, message: 'Gagal create session', error: String(err) }); }
+});
+
+// Get QR
+app.get('/get-qr', (req, res) => {
+    const { sender } = req.query;
+    if (!sender) return res.status(400).send('sender wajib diisi');
+    const qrData = qrStore.get(sender);
+    if (!qrData?.dataUrl) return res.status(404).send('QR belum tersedia atau session sudah login');
+    const base64Data = qrData.dataUrl.replace(/^data:image\/png;base64,/, '');
+    res.setHeader('Content-Type', 'image/png');
+    return res.send(Buffer.from(base64Data, 'base64'));
+});
+
+function getSimpleError(err) {
+    const msg = String(err?.message || err || '').toLowerCase();
+    const code = err?.output?.statusCode || err?.statusCode || err?.status;
+
+    if (code === 401 || msg.includes('logged out') || msg.includes('not-authorized')) {
+        return { code: 401, text: 'session not logged in' };
+    }
+
+    if (msg.includes('connection closed') || msg.includes('connection lost') || msg.includes('timed out')) {
+        return { code: 503, text: 'connection failed' };
+    }
+
+    if (msg.includes('jid')) {
+        return { code: 400, text: 'invalid number / group' };
+    }
+
+    return { code: 500, text: 'send failed' };
+}
+
+
+async function checkWhatsAppNumber(sock, number) {
+    const jid = number.includes('@') ? number : phoneNumberFormatter(number);
+    const result = await sock.onWhatsApp(jid);
+    return {
+        jid,
+        exists: Array.isArray(result) && result.length > 0
+    };
+}
+
+// Send personal message
+app.post('/send-message', requireApiKey, async (req, res) => {
+    const { sender, number, message } = req.body;
+
+    // Validate required fields first
+    if (!sender || !number || !message)
+        return res.status(400).json({ status: false, response: 'sender, number, dan message wajib diisi' });
+
+    const session = sessionMap.get(sender);
+    if (!session?.sock) {
+        return res.status(401).json({ status: false, response: 'session not logged in' });
+    }
+
+    try {
+        const check = await checkWhatsAppNumber(session.sock, number);
+
+        // Check if the number exists on WhatsApp
+        if (!check.exists) {
+            return res.status(404).json({ status: false, response: 'number not registered' });
+        }
+
+        // Send the message if everything is valid
+        const response = await session.sock.sendMessage(check.jid, { text: message });
+        updateLastActive(sender);
+        db.logMessage(sender, 'out', check.jid, 'text', message, response?.key?.id).catch(err => logger.error('DB logMessage: ' + err));
+        return res.json({ status: true, response: 'message sent', data: response });
+    } catch (err) {
+        const e = getSimpleError(err); // Get the error using the updated function
+        return res.status(e.code).json({ status: false, response: e.text });
+    }
+});
+
+function buildMediaPayload(ft, url, filename, caption) {
+    if (['jpg', 'jpeg', 'png'].includes(ft))
+        return { image: { url }, caption };
+    if (ft === 'pdf')
+        return { document: { url }, fileName: filename, mimetype: 'application/pdf', caption };
+    return null;
+}
+
+// Send personal media
+app.post('/send-media', requireApiKey, async (req, res) => {
+    const { sender, number, url, filetype, filename, caption } = req.body;
+    if (!sender || !number || !url || !filetype)
+        return res.status(400).json({ status: false, response: 'incomplete data' });
+
+    const session = sessionMap.get(sender);
+    if (!session?.sock) return res.status(401).json({ status: false, response: 'session not logged in' });
+
+    const ft = String(filetype).toLowerCase();
+    const payload = buildMediaPayload(ft, url, filename, caption);
+    if (!payload) return res.status(400).json({ status: false, response: 'unsupported file type' });
+
+    try {
+        const check = await checkWhatsAppNumber(session.sock, number);
+        if (!check.exists) return res.status(404).json({ status: false, response: 'number not registered' });
+        const response = await session.sock.sendMessage(check.jid, payload);
+        updateLastActive(sender);
+        return res.json({ status: true, response: 'media sent', data: response });
+    } catch (err) {
+        const e = getSimpleError(err);
+        return res.status(e.code).json({ status: false, response: e.text });
+    }
+});
+
+// Send message to group
+app.post('/send-group-message', requireApiKey, async (req, res) => {
+    const { sender, groupId, message } = req.body;
+    const session = sessionMap.get(sender);
+
+    if (!session?.sock) {
+        return res.status(401).json({ status: false, response: 'session not logged in' });
+    }
+
+    if (!sender || !groupId || !message) {
+        return res.status(400).json({ status: false, response: 'incomplete data' });
+    }
+
+    try {
+        const response = await session.sock.sendMessage(groupId, { text: message });
+        updateLastActive(sender);
+        db.logMessage(sender, 'out', groupId, 'text', message, response?.key?.id).catch(err => logger.error('DB logMessage: ' + err));
+        return res.json({ status: true, response: 'message sent', data: response });
+    } catch (err) {
+        const e = getSimpleError(err);
+        return res.status(e.code).json({ status: false, response: e.text });
+    }
+});
+
+// Send media to group
+app.post('/send-group-media', requireApiKey, async (req, res) => {
+    const { sender, groupId, url, filetype, filename, caption } = req.body;
+    if (!sender || !groupId || !url || !filetype)
+        return res.status(400).json({ status: false, response: 'incomplete data' });
+
+    const session = sessionMap.get(sender);
+    if (!session?.sock) return res.status(401).json({ status: false, response: 'session not logged in' });
+
+    const ft = String(filetype).toLowerCase();
+    const payload = buildMediaPayload(ft, url, filename, caption);
+    if (!payload) return res.status(400).json({ status: false, response: 'unsupported file type' });
+
+    try {
+        const response = await session.sock.sendMessage(groupId, payload);
+        updateLastActive(sender);
+        return res.json({ status: true, response: 'media sent', data: response });
+    } catch (err) {
+        const e = getSimpleError(err);
+        return res.status(e.code).json({ status: false, response: e.text });
+    }
+});
+
+// Check number
+app.post('/check-number', async (req, res) => {
+    const { sender, number } = req.body;
+    const session = sessionMap.get(sender);
+
+    // Check if session is not logged in (offline)
+    if (!session?.sock) {
+        return res.status(401).json({ status: false, response: 'session not logged in' });
+    }
+
+    try {
+        const check = await checkWhatsAppNumber(session.sock, number);
+        if (!check.exists) return res.status(404).json({ status: false, response: 'number not registered' });
+        updateLastActive(sender);
+        return res.json({ status: true, isWhatsApp: true, number: check.jid });
+    } catch (err) {
+        const e = getSimpleError(err);
+        return res.status(e.code).json({ status: false, response: e.text });
+    }
+});
+
+// Get groups
+app.get('/get-groups', async (req, res) => {
+    const { sender } = req.query;
+    const session = sessionMap.get(sender);
+    if (!session?.sock) return res.status(401).json({ status: false, response: 'Session belum login' });
+    try {
+        const groups = await session.sock.groupFetchAllParticipating();
+        const groupNames = Object.keys(groups).map(id => ({ id, name: groups[id].subject }));
+        updateLastActive(sender);
+        res.json({ status: true, groups: groupNames });
+    } catch (err) { res.status(500).json({ status: false, response: String(err) }); }
+});
+
+// Get participants
+app.get('/get-participants', async (req, res) => {
+    const { sender, groupId } = req.query;
+    const session = sessionMap.get(sender);
+    if (!session?.sock) return res.status(401).json({ status: false, response: 'Session belum login' });
+    try {
+        const metadata = await session.sock.groupMetadata(groupId);
+        updateLastActive(sender);
+        res.json({ status: true, participants: metadata?.participants || [] });
+    } catch (err) { res.status(500).json({ status: false, response: String(err) }); }
+});
+
+// Logout
+app.post('/logout', requireAuth, async (req, res) => {
+    if (!await requireOwnership(req, res)) return;
+    const { sender } = req.body;
+    const session = sessionMap.get(sender);
+    if (!session?.sock) return res.status(401).json({ status: false, response: 'Tidak ada session aktif' });
+    try { await session.sock.logout(); await removeSessionCompletely(sender); res.json({ status: true, message: 'Logout berhasil' }); }
+    catch (err) { res.status(500).json({ status: false, response: String(err) }); }
+});
+
+// Initialize sessions from auth_info
+async function initializeSessionsFromAuthInfo() {
+    await ensureAuthInfoFolder();
+    const entries = await fsp.readdir(authInfoDir, { withFileTypes: true });
+    for (const entry of entries) { if (!entry.isDirectory()) continue; const credkey = entry.name; try { await connectToWhatsApp(credkey); } catch (err) { logger.error(err); } }
+}
+
+server.listen(port, async () => {
+    logger.info(`Server berjalan di port ${port}`);
+    await db.initDB();
+    await initializeSessionsFromAuthInfo();
+});
