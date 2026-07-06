@@ -217,7 +217,7 @@ async function fetchStatus() {
     const known = ['connected', 'qr', 'reconnecting', 'offline']
     sessionState.value = known.includes(data.state) ? data.state : 'offline'
     // ponytail: /get-qr returns PNG directly, no need to convert — just point img src at it
-    qrUrl.value = data.state === 'qr' ? `/get-qr?sender=${credkey}&t=${Date.now()}` : null
+    qrUrl.value = data.state === 'qr' ? (`/api/get-qr?sender=${credkey}&t=${Date.now()}`) : null
   } catch {
     // non-fatal poll failure
   }

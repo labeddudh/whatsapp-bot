@@ -1,7 +1,8 @@
 import axios from 'axios'
 
-// ponytail: no baseURL = same-origin, vite proxy handles /auth /bots etc in dev
-const api = axios.create({ baseURL: import.meta.env.VITE_API_URL || '' })
+const api = axios.create({
+    baseURL: import.meta.env.VITE_API_URL || '/api'
+})
 
 api.interceptors.request.use(cfg => {
     const token = localStorage.getItem('token')

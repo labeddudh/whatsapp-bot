@@ -321,7 +321,7 @@ app.post('/create-session', requireAuth, async (req, res) => {
 });
 
 // Get QR
-app.get('/get-qr', requireAuth, (req, res) => {
+app.get('/get-qr', (req, res) => {
     const { sender } = req.query;
     if (!sender) return res.status(400).send('sender wajib diisi');
     const qrData = qrStore.get(sender);
